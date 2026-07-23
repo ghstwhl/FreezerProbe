@@ -8,11 +8,12 @@ ESP32-based temperature monitoring system for freezers and refrigerators with pu
 - 📱 Push notifications via Prowl API
 - 📧 Email notifications via SMTP
 - 📊 Temperature history with web-based graphing
-- 🔄 Over-The-Air (OTA) updates with optional password protection
+- � Alert history table showing all sent notifications
+- ⚠️ Sensor disconnection alerts with automatic recovery detection- 🕒 NTP time synchronization with configurable timezone- 🔄 Over-The-Air (OTA) updates with optional password protection
 - 📶 WiFi Manager for easy setup (no hardcoded credentials)
 - 🌐 Web interface accessible via browser
 - 💾 Persistent settings stored in flash memory
-- 🔔 Smart alerting with cooldown to prevent spam
+- 🔔 Smart alerting with 5-minute cooldown to prevent spam
 - 🏷️ Configurable device name for multi-device setups
 - 🔒 Secure field handling for API keys and passwords (masked display)
 
@@ -230,18 +231,23 @@ After connecting to WiFi, access the web interface:
    - Only letters, numbers, spaces, hyphens, underscores, and periods allowed
    - Cannot start or end with a hyphen
    - Hostname is auto-generated: "Basement Freezer" becomes http://basement-freezer.local
-2. Set **Lower Temperature Threshold** (e.g., -25°C)
-3. Set **Upper Temperature Threshold** (e.g., -15°C)
-4. **(Optional)** Get a Prowl API key from https://www.prowlapp.com and enter it
-5. **(Optional)** Configure OTA Password to secure firmware updates
-6. **(Optional)** Enable Email Notifications and configure:
+2. Select **Timezone** from the dropdown
+   - Choose your local timezone for accurate timestamp display
+   - Time is synchronized via NTP automatically at startup
+   - NTP updates occur every 5 minutes to maintain accuracy
+   - Timestamps in temperature and alert history use your selected timezone
+3. Set **Lower Temperature Threshold** (e.g., -25°C)
+4. Set **Upper Temperature Threshold** (e.g., -15°C)
+5. **(Optional)** Get a Prowl API key from https://www.prowlapp.com and enter it
+6. **(Optional)** Configure OTA Password to secure firmware updates
+7. **(Optional)** Enable Email Notifications and configure:
    - **Sender Email Address** - The "from" address for notifications
    - **Recipient Email Address** - Where alerts will be sent
    - **SMTP Server** - Your email provider's SMTP server (e.g., smtp.gmail.com)
    - **SMTP Port** - Usually 587 (TLS) or 465 (SSL)
    - **SMTP Username** (optional) - Leave empty to use sender email
    - **SMTP Password** - Your email password or app-specific password
-7. Click "Save Settings"
+8. Click "Save Settings"
 
 **Note**: For Gmail, you'll need to create an [App Password](https://myaccount.google.com/apppasswords) instead of using your regular password.
 
@@ -323,7 +329,9 @@ The web interface provides:
   - 🔵 Blue: Below lower threshold
   - 🟢 Green: Within normal range
   - 🔴 Red: Above upper threshold
-- **Temperature history graph** (last 48 hours)
+- **Temperature history graph** (last 48 hours with local time)
+- **Alert history table** showing last 50 notifications sent with timestamps
+- **Timezone configuration** with automatic NTP synchronization
 - **Threshold configuration**
 - **Prowl API key setup** with masked display
 - **OTA password configuration** for secure firmware updates
@@ -337,10 +345,41 @@ Notifications are sent via **Prowl** and/or **Email** when:
 - Temperature drops below lower threshold
 - Temperature rises above upper threshold  
 - Temperature returns to normal range (recovery notification)
+- **Sensor disconnects or error reading temperature** (high priority alert)
+- **Sensor reconnects** after being disconnected (recovery notification)
 
 All notifications include the **device name** to help identify which freezer/fridge sent the alert.
 
 **Note**: 5-minute cooldown between alerts prevents spam
+
+#### Sensor Error Alerts
+
+The system monitors sensor connectivity and will send high-priority alerts if:
+- The DS18B20 sensor becomes disconnected
+- Temperature readings fail or return error values
+- Communication errors occur on the 1-Wire bus
+
+When the sensor recovers:
+- A normal-priority recovery notification is sent
+- Current temperature is included in the recovery message
+- Temperature monitoring resumes automatically
+
+This ensures you're notified immediately if your monitoring system loses sensor connectivity, preventing silent failures.
+
+#### Alert History
+
+The web interface includes an **Alert History** table that displays:
+- **Timestamp** - When each alert was sent
+- **Alert Message** - The full notification text
+- **Priority** - HIGH (temperature/sensor alerts) or NORMAL (recovery)
+- **Sent Via** - Shows which notification methods were used (📱 Prowl, 📧 Email)
+
+The alert history:
+- Stores the last **50 alerts** in memory
+- Updates automatically every 30 seconds
+- Shows most recent alerts first
+- Persists until device restart (not saved to flash)
+- Helps diagnose recurring issues or patterns
 
 #### Email Configuration
 
@@ -396,6 +435,7 @@ See section "3. Change Partition Scheme" above for detailed instructions.
 - Verify DS18B20 is genuine (many counterfeits exist)
 - Try a different GPIO pin
 - Check for loose connections
+- **Note**: If notifications are configured, you'll receive a high-priority alert when the sensor disconnects and a recovery notification when it reconnects
 
 ### Can't Connect to WiFi
 
@@ -440,7 +480,11 @@ See section "3. Change Partition Scheme" above for detailed instructions.
 
 - **Temperature Reading Interval**: 10 seconds
 - **Temperature History**: 288 readings (48 hours)
+- **Alert History**: 50 most recent alerts (in memory, cleared on restart)
 - **Alert Cooldown**: 5 minutes
+- **NTP Sync Interval**: 5 minutes (automatic time synchronization)
+- **NTP Servers**: pool.ntp.org, time.nist.gov
+- **Timezone Support**: Configurable via POSIX TZ strings (25+ common timezones)
 - **Web Server Port**: 80
 - **OTA Port**: 3232
 - **Sensor Resolution**: 12-bit (0.0625°C precision)
@@ -452,7 +496,8 @@ See section "3. Change Partition Scheme" above for detailed instructions.
 - `GET /` - Web interface
 - `GET /status` - JSON status (temp, thresholds, connection info)
   - **Note**: Secure fields (Prowl API key, OTA password, SMTP password) are never returned. Only boolean flags indicate if they're configured.
-- `GET /history` - JSON temperature history
+- `GET /history` - JSON temperature history (last 288 readings, 48 hours)
+- `GET /alerts` - JSON alert history (last 50 alerts sent)
 - `POST /settings` - Update settings (secure fields only updated if explicitly provided)
 - `POST /reset` - Reset WiFi settings
 

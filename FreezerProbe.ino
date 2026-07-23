@@ -22,6 +22,7 @@
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>
 #include <ESP_Mail_Client.h>
+#include <time.h>
 
 // ===== Hardware Configuration =====
 #define ONE_WIRE_BUS 4        // GPIO pin for DS18B20 data line (change as needed)
@@ -31,6 +32,8 @@
 #define TEMP_READ_INTERVAL 10000    // Read temperature every 10 seconds
 #define ALERT_COOLDOWN 300000       // Wait 5 minutes between alerts (avoid spam)
 #define HISTORY_SIZE 288            // Store 288 readings (48 hours at 10-second intervals)
+#define ALERT_HISTORY_SIZE 50       // Store last 50 alerts
+#define NTP_UPDATE_INTERVAL 300000  // Update NTP time every 5 minutes
 
 // ===== Global Objects =====
 OneWire oneWire(ONE_WIRE_BUS);
@@ -51,6 +54,19 @@ TempReading tempHistory[HISTORY_SIZE];
 int historyIndex = 0;
 int historyCount = 0;
 
+// ===== Alert History =====
+struct AlertRecord {
+  unsigned long timestamp;
+  String message;
+  int priority;
+  bool sentViaProwl;
+  bool sentViaEmail;
+};
+
+AlertRecord alertHistory[ALERT_HISTORY_SIZE];
+int alertHistoryIndex = 0;
+int alertHistoryCount = 0;
+
 // ===== Global Variables =====
 String deviceName = "FreezerProbe";
 float currentTemperature = 0.0;
@@ -58,6 +74,7 @@ float lowerThreshold = -20.0;
 float upperThreshold = -10.0;
 String prowlApiKey = "";
 String otaPassword = "";
+String timezone = "UTC0"; // Default to UTC
 
 // Email settings
 bool emailEnabled = false;
@@ -72,8 +89,10 @@ bool sensorConnected = false;
 
 unsigned long lastTempRead = 0;
 unsigned long lastAlertTime = 0;
+unsigned long lastNtpUpdate = 0;
 bool lastAlertWasHigh = false;
 bool lastAlertWasLow = false;
+bool lastAlertWasSensorError = false;
 
 // ===== Function Prototypes =====
 void connectWiFi();
@@ -83,7 +102,11 @@ void handleRoot();
 void handleSettings();
 void handleGetStatus();
 void handleGetHistory();
+void handleGetAlertHistory();
 void readTemperature();
+void addToAlertHistory(String message, int priority, bool prowl, bool email);
+void configureTime();
+time_t getCurrentTime();
 void addToHistory(float temp);
 void checkAlerts();
 void sendProwlNotification(String message, int priority);
@@ -125,6 +148,9 @@ void setup() {
   // Connect to WiFi using WiFiManager
   connectWiFi();
   
+  // Configure NTP time synchronization
+  configureTime();
+  
   // Setup OTA updates
   setupOTA();
   
@@ -148,6 +174,12 @@ void setup() {
 void loop() {
   ArduinoOTA.handle(); // Handle OTA updates
   server.handleClient();
+  
+  // Update NTP time periodically
+  if (millis() - lastNtpUpdate >= NTP_UPDATE_INTERVAL) {
+    configureTime();
+    lastNtpUpdate = millis();
+  }
   
   // Read temperature at intervals
   if (millis() - lastTempRead >= TEMP_READ_INTERVAL) {
@@ -252,12 +284,53 @@ void setupOTA() {
   Serial.println(WiFi.localIP());
 }
 
+// ===== Time Configuration Functions =====
+void configureTime() {
+  Serial.println("Configuring NTP time...");
+  
+  // Configure NTP with timezone string
+  // Format: <std><offset><dst>,<dstStart>,<dstEnd>
+  // Examples: "EST5EDT,M3.2.0,M11.1.0" for US Eastern
+  //           "UTC0" for UTC
+  //           "CET-1CEST,M3.5.0,M10.5.0/3" for Central Europe
+  
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  
+  // Set timezone using POSIX TZ string
+  setenv("TZ", timezone.c_str(), 1);
+  tzset();
+  
+  // Wait for time to be set
+  int retries = 0;
+  time_t now;
+  while ((now = time(nullptr)) < 8 * 3600 * 2 && retries < 15) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  Serial.println();
+  
+  if (now >= 8 * 3600 * 2) {
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    Serial.print("Time synchronized: ");
+    Serial.println(asctime(&timeinfo));
+  } else {
+    Serial.println("Failed to synchronize time");
+  }
+}
+
+time_t getCurrentTime() {
+  return time(nullptr);
+}
+
 // ===== Web Server Functions =====
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/settings", HTTP_POST, handleSettings);
   server.on("/status", HTTP_GET, handleGetStatus);
   server.on("/history", HTTP_GET, handleGetHistory);
+  server.on("/alerts", HTTP_GET, handleGetAlertHistory);
   server.on("/reset", HTTP_POST, []() {
     server.send(200, "text/plain", "Resetting WiFi settings...");
     delay(1000);
@@ -315,6 +388,17 @@ void handleSettings() {
   
   if (server.hasArg("otaPassword")) {
     otaPassword = server.arg("otaPassword");
+    updated = true;
+  }
+  
+  // Timezone setting
+  bool timezoneChanged = false;
+  if (server.hasArg("timezone")) {
+    String newTimezone = server.arg("timezone");
+    if (newTimezone != timezone) {
+      timezone = newTimezone;
+      timezoneChanged = true;
+    }
     updated = true;
   }
   
@@ -378,6 +462,7 @@ void handleSettings() {
     // Reset alert state when settings change
     lastAlertWasHigh = false;
     lastAlertWasLow = false;
+    lastAlertWasSensorError = false;
     
     Serial.println("Settings updated:");
     Serial.printf("  Device Name: %s\n", deviceName.c_str());
@@ -398,6 +483,12 @@ void handleSettings() {
       Serial.printf("Hostname updated to: %s.local\n", hostname.c_str());
     }
     
+    // Reconfigure time if timezone changed
+    if (timezoneChanged) {
+      configureTime();
+      Serial.printf("Timezone updated to: %s\n", timezone.c_str());
+    }
+    
     server.send(200, "text/plain", "Settings saved successfully");
   } else {
     server.send(400, "text/plain", "No settings provided");
@@ -407,6 +498,7 @@ void handleSettings() {
 void handleGetStatus() {
   String json = "{";
   json += "\"deviceName\":\"" + deviceName + "\",";
+  json += "\"timezone\":\"" + timezone + "\",";
   json += "\"temperature\":" + String(currentTemperature, 2) + ",";
   json += "\"lowerThreshold\":" + String(lowerThreshold, 2) + ",";
   json += "\"upperThreshold\":" + String(upperThreshold, 2) + ",";
@@ -449,6 +541,29 @@ void handleGetHistory() {
   server.send(200, "application/json", json);
 }
 
+void handleGetAlertHistory() {
+  String json = "{\"alerts\":[";
+  
+  // Send alert history (most recent first)
+  int count = min(alertHistoryCount, ALERT_HISTORY_SIZE);
+  for (int i = count - 1; i >= 0; i--) {
+    // Calculate actual index (circular buffer, reverse order)
+    int idx = (alertHistoryIndex - 1 - (count - 1 - i) + ALERT_HISTORY_SIZE) % ALERT_HISTORY_SIZE;
+    
+    if (i < count - 1) json += ",";
+    json += "{";
+    json += "\"time\":" + String(alertHistory[idx].timestamp) + ",";
+    json += "\"message\":\"" + alertHistory[idx].message + "\",";
+    json += "\"priority\":" + String(alertHistory[idx].priority) + ",";
+    json += "\"prowl\":" + String(alertHistory[idx].sentViaProwl ? "true" : "false") + ",";
+    json += "\"email\":" + String(alertHistory[idx].sentViaEmail ? "true" : "false");
+    json += "}";
+  }
+  
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
 // ===== Temperature Functions =====
 void readTemperature() {
   if (!sensorConnected) {
@@ -480,7 +595,7 @@ void readTemperature() {
 }
 
 void addToHistory(float temp) {
-  tempHistory[historyIndex].timestamp = millis() / 1000; // Store time in seconds
+  tempHistory[historyIndex].timestamp = getCurrentTime(); // Store Unix timestamp
   tempHistory[historyIndex].temperature = temp;
   
   historyIndex = (historyIndex + 1) % HISTORY_SIZE;
@@ -489,10 +604,23 @@ void addToHistory(float temp) {
   }
 }
 
+void addToAlertHistory(String message, int priority, bool prowl, bool email) {
+  alertHistory[alertHistoryIndex].timestamp = getCurrentTime(); // Store Unix timestamp
+  alertHistory[alertHistoryIndex].message = message;
+  alertHistory[alertHistoryIndex].priority = priority;
+  alertHistory[alertHistoryIndex].sentViaProwl = prowl;
+  alertHistory[alertHistoryIndex].sentViaEmail = email;
+  
+  alertHistoryIndex = (alertHistoryIndex + 1) % ALERT_HISTORY_SIZE;
+  if (alertHistoryCount < ALERT_HISTORY_SIZE) {
+    alertHistoryCount++;
+  }
+}
+
 void checkAlerts() {
-  // Don't check alerts if sensor is disconnected or no notification method configured
+  // Don't check alerts if no notification method configured
   bool notificationConfigured = (prowlApiKey.length() > 0) || (emailEnabled && emailSender.length() > 0);
-  if (!sensorConnected || !notificationConfigured || currentTemperature == -999.0) {
+  if (!notificationConfigured) {
     return;
   }
   
@@ -505,7 +633,29 @@ void checkAlerts() {
   String alertMessage = "";
   int priority = 0;
   
-  if (currentTemperature < lowerThreshold && !lastAlertWasLow) {
+  // Check for sensor disconnection or error
+  if (!sensorConnected || currentTemperature == -999.0) {
+    if (!lastAlertWasSensorError) {
+      // Sensor just disconnected or error occurred
+      sendAlert = true;
+      lastAlertWasSensorError = true;
+      lastAlertWasHigh = false;
+      lastAlertWasLow = false;
+      alertMessage = "[" + deviceName + "] ALERT: Temperature sensor disconnected or error reading sensor!";
+      priority = 2; // High priority
+      Serial.println(alertMessage);
+    }
+  }
+  // Check for sensor recovery
+  else if (lastAlertWasSensorError) {
+    sendAlert = true;
+    lastAlertWasSensorError = false;
+    alertMessage = "[" + deviceName + "] Sensor reconnected. Current temperature: " + String(currentTemperature, 2) + "°C";
+    priority = 0; // Normal priority
+    Serial.println(alertMessage);
+  }
+  // Normal temperature threshold checks (only if sensor is working)
+  else if (currentTemperature < lowerThreshold && !lastAlertWasLow) {
     sendAlert = true;
     lastAlertWasLow = true;
     lastAlertWasHigh = false;
@@ -534,19 +684,29 @@ void checkAlerts() {
   }
   
   if (sendAlert) {
+    bool sentProwl = false;
+    bool sentEmail = false;
+    
     // Send Prowl notification if configured
     if (prowlApiKey.length() > 0) {
       sendProwlNotification(alertMessage, priority);
+      sentProwl = true;
     }
     
     // Send Email notification if configured
     if (emailEnabled && emailSender.length() > 0) {
       String subject = deviceName + " Temperature Alert";
-      if (priority == 0) {
-        subject = deviceName + " Temperature Normal";
+      if (lastAlertWasSensorError && priority == 2) {
+        subject = deviceName + " Sensor Error";
+      } else if (priority == 0) {
+        subject = deviceName + " Status Normal";
       }
       sendEmailNotification(subject, alertMessage, priority);
+      sentEmail = true;
     }
+    
+    // Record alert in history
+    addToAlertHistory(alertMessage, priority, sentProwl, sentEmail);
     
     lastAlertTime = millis();
   }
@@ -682,6 +842,7 @@ void loadSettings() {
   upperThreshold = preferences.getFloat("upperThresh", -10.0);
   prowlApiKey = preferences.getString("prowlKey", "");
   otaPassword = preferences.getString("otaPassword", "");
+  timezone = preferences.getString("timezone", "UTC0");
   
   // Email settings
   emailEnabled = preferences.getBool("emailEnabled", false);
@@ -694,6 +855,7 @@ void loadSettings() {
   
   Serial.println("Settings loaded:");
   Serial.printf("  Device Name: %s\n", deviceName.c_str());
+  Serial.printf("  Timezone: %s\n", timezone.c_str());
   Serial.printf("  Lower Threshold: %.2f°C\n", lowerThreshold);
   Serial.printf("  Upper Threshold: %.2f°C\n", upperThreshold);
   Serial.printf("  Prowl API Key: %s\n", prowlApiKey.length() > 0 ? "SET" : "NOT SET");
@@ -706,6 +868,7 @@ void saveSettings() {
   preferences.putFloat("upperThresh", upperThreshold);
   preferences.putString("prowlKey", prowlApiKey);
   preferences.putString("otaPassword", otaPassword);
+  preferences.putString("timezone", timezone);
   
   // Email settings
   preferences.putBool("emailEnabled", emailEnabled);
@@ -995,6 +1158,64 @@ String getHTML() {
       padding-bottom: 10px;
       border-bottom: 2px solid #667eea;
     }
+    .alert-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      margin-bottom: 30px;
+    }
+    .alert-table th {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 12px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 0.9em;
+    }
+    .alert-table td {
+      padding: 12px;
+      border-bottom: 1px solid #e0e0e0;
+      font-size: 0.9em;
+    }
+    .alert-table tr:last-child td {
+      border-bottom: none;
+    }
+    .alert-table tr:hover {
+      background: #f5f5f5;
+    }
+    .priority-badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.8em;
+      font-weight: 600;
+    }
+    .priority-high {
+      background: #ffebee;
+      color: #c62828;
+    }
+    .priority-normal {
+      background: #e8f5e9;
+      color: #2e7d32;
+    }
+    .method-badge {
+      display: inline-block;
+      padding: 3px 6px;
+      border-radius: 3px;
+      font-size: 0.75em;
+      margin-right: 4px;
+      background: #e3f2fd;
+      color: #1565c0;
+    }
+    .no-alerts {
+      text-align: center;
+      padding: 40px;
+      color: #999;
+      font-style: italic;
+    }
   </style>
 </head>
 <body>
@@ -1037,6 +1258,25 @@ String getHTML() {
         <canvas id="tempChart"></canvas>
       </div>
       
+      <h2 class="section-title">🔔 Alert History</h2>
+      <div style="overflow-x: auto;">
+        <table class="alert-table" id="alertTable">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Alert Message</th>
+              <th>Priority</th>
+              <th>Sent Via</th>
+            </tr>
+          </thead>
+          <tbody id="alertTableBody">
+            <tr>
+              <td colspan="4" class="no-alerts">No alerts recorded yet</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      
       <div class="info-box">
         ℹ️ Alerts will be sent via Prowl and/or Email when temperature goes outside the threshold range. 
         A 5-minute cooldown prevents notification spam. Configure at least one notification method below.
@@ -1050,6 +1290,37 @@ String getHTML() {
           <input type="text" id="deviceName" name="deviceName" placeholder="FreezerProbe" required pattern="[A-Za-z0-9][A-Za-z0-9 ._-]*[A-Za-z0-9]|[A-Za-z0-9]" maxlength="63">
           <small style="color: #666; display: block; margin-top: 5px;">
             Used in notifications and as hostname (http://[name].local). Use only letters, numbers, spaces, hyphens, underscores, and periods. Cannot start/end with hyphen.
+          </small>
+        </div>
+        
+        <div class="form-group">
+          <label for="timezone">Timezone</label>
+          <select id="timezone" name="timezone" style="width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px;">
+            <option value="UTC0">UTC (GMT+0)</option>
+            <option value="GMT0BST,M3.5.0/1,M10.5.0">UK (GMT/BST)</option>
+            <option value="CET-1CEST,M3.5.0,M10.5.0/3">Central Europe (CET/CEST)</option>
+            <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Eastern Europe (EET/EEST)</option>
+            <option value="EST5EDT,M3.2.0,M11.1.0">US Eastern (EST/EDT)</option>
+            <option value="CST6CDT,M3.2.0,M11.1.0">US Central (CST/CDT)</option>
+            <option value="MST7MDT,M3.2.0,M11.1.0">US Mountain (MST/MDT)</option>
+            <option value="PST8PDT,M3.2.0,M11.1.0">US Pacific (PST/PDT)</option>
+            <option value="AKST9AKDT,M3.2.0,M11.1.0">Alaska (AKST/AKDT)</option>
+            <option value="HST10">Hawaii (HST)</option>
+            <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australia East (AEST/AEDT)</option>
+            <option value="ACST-9:30ACDT,M10.1.0,M4.1.0/3">Australia Central (ACST/ACDT)</option>
+            <option value="AWST-8">Australia West (AWST)</option>
+            <option value="NZST-12NZDT,M9.5.0,M4.1.0/3">New Zealand (NZST/NZDT)</option>
+            <option value="JST-9">Japan (JST)</option>
+            <option value="KST-9">Korea (KST)</option>
+            <option value="CST-8">China (CST)</option>
+            <option value="IST-5:30">India (IST)</option>
+            <option value="<+03>-3">Moscow (MSK)</option>
+            <option value="WIB-7">Indonesia West (WIB)</option>
+            <option value="WITA-8">Indonesia Central (WITA)</option>
+            <option value="WIT-9">Indonesia East (WIT)</option>
+          </select>
+          <small style="color: #666; display: block; margin-top: 5px;">
+            Select your local timezone. Time will be synchronized via NTP every 5 minutes.
           </small>
         </div>
         
@@ -1242,6 +1513,70 @@ String getHTML() {
         });
     }
     
+    // Update alert history table
+    function updateAlertHistory() {
+      fetch('/alerts')
+        .then(response => response.json())
+        .then(data => {
+          const alerts = data.alerts || [];
+          const tbody = document.getElementById('alertTableBody');
+          
+          if (alerts.length === 0) {
+            tbody.innerHTML = '<tr><td colspan=\"4\" class=\"no-alerts\">No alerts recorded yet</td></tr>';
+            return;
+          }
+          
+          tbody.innerHTML = '';
+          alerts.forEach(alert => {
+            const row = document.createElement('tr');
+            
+            // Time column
+            const date = new Date(alert.time * 1000);
+            const timeCell = document.createElement('td');
+            timeCell.textContent = date.toLocaleString();
+            row.appendChild(timeCell);
+            
+            // Message column
+            const msgCell = document.createElement('td');
+            msgCell.textContent = alert.message;
+            row.appendChild(msgCell);
+            
+            // Priority column
+            const priorityCell = document.createElement('td');
+            const priorityBadge = document.createElement('span');
+            priorityBadge.className = 'priority-badge ' + (alert.priority >= 2 ? 'priority-high' : 'priority-normal');
+            priorityBadge.textContent = alert.priority >= 2 ? 'HIGH' : 'NORMAL';
+            priorityCell.appendChild(priorityBadge);
+            row.appendChild(priorityCell);
+            
+            // Sent via column
+            const methodCell = document.createElement('td');
+            if (alert.prowl) {
+              const prowlBadge = document.createElement('span');
+              prowlBadge.className = 'method-badge';
+              prowlBadge.textContent = '📱 Prowl';
+              methodCell.appendChild(prowlBadge);
+            }
+            if (alert.email) {
+              const emailBadge = document.createElement('span');
+              emailBadge.className = 'method-badge';
+              emailBadge.textContent = '📧 Email';
+              methodCell.appendChild(emailBadge);
+            }
+            if (!alert.prowl && !alert.email) {
+              methodCell.textContent = 'None';
+              methodCell.style.color = '#999';
+            }
+            row.appendChild(methodCell);
+            
+            tbody.appendChild(row);
+          });
+        })
+        .catch(error => {
+          console.error('Error fetching alert history:', error);
+        });
+    }
+    
     // Update status every 5 seconds
     function updateStatus() {
       fetch('/status')
@@ -1288,6 +1623,7 @@ String getHTML() {
           // Only populate form fields on first load
           if (!formLoaded) {
             document.getElementById('deviceName').value = data.deviceName || 'FreezerProbe';
+            document.getElementById('timezone').value = data.timezone || 'UTC0';
             document.getElementById('lowerThreshold').value = data.lowerThreshold;
             document.getElementById('upperThreshold').value = data.upperThreshold;
             
@@ -1506,12 +1842,16 @@ String getHTML() {
     initChart();
     updateStatus();
     updateHistory();
+    updateAlertHistory();
     
     // Update status every 5 seconds
     setInterval(updateStatus, 5000);
     
     // Update history every 30 seconds
     setInterval(updateHistory, 30000);
+    
+    // Update alert history every 30 seconds
+    setInterval(updateAlertHistory, 30000);
   </script>
 </body>
 </html>
