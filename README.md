@@ -9,7 +9,9 @@ ESP32-based temperature monitoring system for freezers and refrigerators with pu
 - 📧 Email notifications via SMTP
 - 📊 Temperature history with web-based graphing
 - � Alert history table showing all sent notifications
-- ⚠️ Sensor disconnection alerts with automatic recovery detection- 🕒 NTP time synchronization with configurable timezone- 🔄 Over-The-Air (OTA) updates with optional password protection
+- ⚠️ Sensor disconnection alerts with automatic recovery detection
+- 🕒 NTP time synchronization with configurable timezone
+- 🔄 Over-The-Air (OTA) updates with optional password protection
 - 📶 WiFi Manager for easy setup (no hardcoded credentials)
 - 🌐 Web interface accessible via browser
 - 💾 Persistent settings stored in flash memory
