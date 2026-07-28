@@ -387,6 +387,7 @@ The web interface provides:
 - **OTA password configuration** for secure firmware updates
 - **Email notification settings** with SMTP password protection
 - **Secure field handling** - API keys and passwords shown as masked after saving
+- **Free heap display** with color coding in the status bar (🟢 Healthy / 🟠 Warning / 🔴 Critical)
 - **WiFi reset** option
 
 ### Notifications
@@ -403,10 +404,43 @@ All notifications include the **device name** to help identify which freezer/fri
 **Alert Thresholds**: Alerts require **3 consecutive out-of-bounds readings** (30 seconds at 10-second intervals) before triggering. This prevents false alarms from brief temperature spikes when opening doors or temporary sensor glitches.
 
 **Prowl Priority Levels**:
-- **High Priority (2)**: Temperature alerts and sensor errors
-- **Low Priority (-2)**: Recovery notifications when conditions return to normal
+- **High Priority (2)**: Temperature alerts, sensor errors, and delivery failures
+- **Normal Priority (0)**: Test messages and recovery notifications via email
+- **Low Priority (-2)**: Recovery notifications via Prowl
 
 **Cooldown**: 5-minute cooldown between alerts prevents notification spam
+
+#### Test Notifications on Settings Save
+
+When Prowl or Email settings are updated, a **test notification** is sent to validate the configuration:
+
+- **Prowl API key changed**: A test Prowl notification is sent immediately
+- **Email settings changed and email enabled**: A test email is sent with SMTP server details, free heap, and uptime for diagnostics
+- The result (success or detailed error) is displayed in the web UI's result banner
+- Test notifications are only sent when the corresponding settings actually change — saving other settings does not trigger tests
+
+#### Delivery Error Notifications
+
+If a notification fails to send, the error is handled with multiple layers of visibility:
+
+1. **Alert History**: Every send failure is recorded in the alert history table with priority HIGH, visible in the web UI
+2. **GUI Display**: When saving settings, the exact error message (e.g., "SMTP error: Unable to connect to mail.example.com:25") appears in the result banner
+3. **Cross-Notification**: If one delivery method fails, the system attempts to notify you via the other method:
+   - Prowl fails → an email alert is sent describing the Prowl failure
+   - Email fails → a Prowl notification is sent with the SMTP error details
+4. **Serial Monitor**: Detailed debug output is logged at 115200 baud, including library-level connection diagnostics
+
+#### Low Memory Alerts
+
+The system monitors free heap memory and sends alerts when resources become critically low:
+
+- **Low heap alert**: Sent when free heap drops below 30 KB (High priority, both Prowl and Email if configured)
+- **Heap recovery alert**: Sent when free heap recovers above 30 KB (Normal priority)
+- **Cooldown**: 1-hour cooldown between heap alerts to prevent spam
+- The web UI status bar shows real-time free heap with color coding:
+  - 🟢 Green (≥ 60 KB): Healthy
+  - 🟠 Orange (30-60 KB): Warning
+  - 🔴 Red (< 30 KB): Critical
 
 #### Sensor Error Alerts
 
@@ -428,16 +462,16 @@ This ensures you're notified of persistent sensor issues while avoiding false al
 
 The web interface includes an **Alert History** table that displays:
 - **Timestamp** - When each alert was sent
-- **Alert Message** - The full notification text
-- **Priority** - HIGH (temperature/sensor alerts) or NORMAL (recovery)
-- **Sent Via** - Shows which notification methods were used (📱 Prowl, 📧 Email)
+- **Alert Message** - The full notification text (including delivery failure errors for debugging)
+- **Priority** - HIGH (temperature/sensor/delivery failure alerts) or NORMAL (recovery/test)
+- **Sent Via** - Shows which notification methods were used (📱 Prowl, 📧 Email). Empty for failed deliveries.
 
 The alert history:
-- Stores the last **50 alerts** in memory
+- Stores the last **50 alerts** in memory (including send failures)
 - Updates automatically every 30 seconds
 - Shows most recent alerts first
 - Persists until device restart (not saved to flash)
-- Helps diagnose recurring issues or patterns
+- Helps diagnose recurring issues, delivery problems, or configuration errors
 
 #### Email Configuration
 
@@ -449,6 +483,7 @@ Common SMTP server settings:
 | Outlook/Hotmail | smtp-mail.outlook.com | 587 | Use your regular password |
 | Yahoo | smtp.mail.yahoo.com | 587 | May require app-specific password |
 | Custom/Self-hosted | Your server | 587/465 | Check with your provider |
+| Plain SMTP (no auth) | Your server | 25 | Leave username and password empty; whitelist-based access |
 
 ### OTA Updates
 
@@ -550,9 +585,11 @@ See section "3. Change Partition Scheme" above for detailed instructions.
 - Verify all required fields are filled (sender, recipient, SMTP server)
 - Check SMTP port is correct (usually 587 for TLS)
 - For Gmail, use an [App Password](https://myaccount.google.com/apppasswords), not your regular password
-- Check serial monitor for SMTP error messages
+- Check serial monitor at 115200 baud for detailed SMTP debug output (connection attempts, server responses, library diagnostics)
 - Some email providers block SMTP access by default - check provider settings
 - Verify SMTP username/password if your server requires authentication
+- For plain SMTP without authentication (port 25, whitelist-based): leave username and password **empty**. The system will skip authentication automatically.
+- Delivery errors are recorded in the Alert History table and visible in the web UI
 
 ### Temperature Readings Incorrect
 
@@ -613,13 +650,18 @@ Connect during OTA to see detailed error messages and memory statistics.
 - **Temperature History**: 288 readings (48 hours)
 - **Alert History**: 50 most recent alerts (in memory, cleared on restart)
 - **Alert Threshold**: 3 consecutive out-of-bounds readings (30 seconds) required before alerting
-- **Alert Cooldown**: 5 minutes between alerts
-- **Prowl Priority Levels**: 2 (high) for alerts, -2 (low) for recovery notifications
-- **NTP Sync Interval**: 5 minutes (automatic time synchronization)
+- **Alert Cooldown**: 5 minutes between temperature alerts
+- **Sensor Retry Interval**: 60 seconds between sensor reconnection attempts
+- **Prowl Priority Levels**: 2 (high) for alerts/delivery failures, 0 (normal) for test/recovery email, -2 (low) for recovery Prowl
+- **NTP Sync Interval**: 5 minutes (validity check only; full reconfiguration only if time appears invalid)
 - **NTP Servers**: pool.ntp.org, time.nist.gov
 - **Timezone Support**: Configurable via POSIX TZ strings (25+ common timezones)
+- **Heap Monitor Interval**: 1 hour (logs free heap to serial; sends alert if below 30 KB)
+- **Heap Warning Threshold**: 30 KB (free heap below this triggers alerts)
+- **Heap Alert Cooldown**: 1 hour between heap alerts
 - **Web Server Port**: 80
 - **OTA Port**: 3232
+- **SMTP TCP Timeout**: 30 seconds
 - **Sensor Resolution**: 12-bit (0.0625°C precision)
 - **Device Name**: 1-63 characters, letters/numbers/spaces/hyphens/underscores/periods, auto-sanitized for DNS
 - **mDNS Hostname**: Auto-generated from device name (lowercase, hyphens replace special chars)

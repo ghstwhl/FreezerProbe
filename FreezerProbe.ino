@@ -37,6 +37,7 @@
 #define NTP_UPDATE_INTERVAL 300000  // Update NTP time every 5 minutes
 #define HEAP_LOG_INTERVAL 3600000   // Log free heap every hour
 #define HEAP_WARN_THRESHOLD 30000   // Warn if free heap drops below 30KB
+#define HEAP_ALERT_COOLDOWN 3600000 // Wait 1 hour between heap alerts (avoid spam)
 
 // ===== Global Objects =====
 OneWire oneWire(ONE_WIRE_BUS);
@@ -95,9 +96,11 @@ unsigned long lastAlertTime = 0;
 unsigned long lastNtpUpdate = 0;
 unsigned long lastSensorRetry = 0;
 unsigned long lastHeapLog = 0;
+unsigned long lastHeapAlertTime = 0;
 bool lastAlertWasHigh = false;
 bool lastAlertWasLow = false;
 bool lastAlertWasSensorError = false;
+bool lastHeapWasLow = false;
 
 // Consecutive reading counters for alert threshold
 int consecutiveLowReadings = 0;
@@ -120,8 +123,8 @@ void configureTime();
 time_t getCurrentTime();
 void addToHistory(float temp);
 void checkAlerts();
-void sendProwlNotification(String message, int priority);
-void sendEmailNotification(String subject, String message, int priority);
+bool sendProwlNotification(String message, int priority, String *errorMsg = nullptr);
+bool sendEmailNotification(String subject, String message, int priority, String *errorMsg = nullptr);
 void smtpCallback(SMTP_Status status);
 String getHTML();
 void loadSettings();
@@ -200,13 +203,67 @@ void loop() {
     lastNtpUpdate = millis();
   }
 
-  // Log free heap periodically to monitor for memory leaks
+  // Log free heap periodically and send alerts if critically low
   if (millis() - lastHeapLog >= HEAP_LOG_INTERVAL) {
     uint32_t freeHeap = ESP.getFreeHeap();
     Serial.printf("[Heap Monitor] Free heap: %u bytes (%.1f KB)\n", freeHeap, freeHeap / 1024.0);
-    if (freeHeap < HEAP_WARN_THRESHOLD) {
-      Serial.printf("⚠️ WARNING: Free heap below %d bytes! Restart may be needed.\n", HEAP_WARN_THRESHOLD);
+
+    bool heapIsLow = (freeHeap < HEAP_WARN_THRESHOLD);
+    bool heapAlertCooldown = (millis() - lastHeapAlertTime >= HEAP_ALERT_COOLDOWN);
+
+    // Check for low heap alert
+    if (heapIsLow && !lastHeapWasLow && heapAlertCooldown) {
+      lastHeapWasLow = true;
+      String alertMessage = "[" + deviceName + "] WARNING: Free heap critically low! " + String(freeHeap) + " bytes (" + String(freeHeap / 1024.0, 1) + " KB) remaining. Restart recommended.";
+      Serial.println(alertMessage);
+
+      bool sentProwl = false;
+      bool sentEmail = false;
+      String prowlError, emailError;
+
+      if (prowlApiKey.length() > 0) {
+        sentProwl = sendProwlNotification(alertMessage, 2, &prowlError); // High priority
+        if (!sentProwl) addToAlertHistory("[" + deviceName + "] Prowl send FAILED: " + prowlError, 2, false, false);
+      }
+
+      if (emailEnabled && emailSender.length() > 0) {
+        String subject = deviceName + " Low Memory Alert";
+        sentEmail = sendEmailNotification(subject, alertMessage, 2, &emailError); // High priority
+        if (!sentEmail) addToAlertHistory("[" + deviceName + "] Email send FAILED: " + emailError, 2, false, false);
+      }
+
+      addToAlertHistory(alertMessage, 2, sentProwl, sentEmail);
+      lastHeapAlertTime = millis();
     }
+    // Check for heap recovery
+    else if (!heapIsLow && lastHeapWasLow && heapAlertCooldown) {
+      lastHeapWasLow = false;
+      String recoveryMsg = "[" + deviceName + "] Heap recovered. Free heap: " + String(freeHeap) + " bytes (" + String(freeHeap / 1024.0, 1) + " KB).";
+      Serial.println(recoveryMsg);
+
+      bool sentProwl = false;
+      bool sentEmail = false;
+      String prowlError, emailError;
+
+      if (prowlApiKey.length() > 0) {
+        sentProwl = sendProwlNotification(recoveryMsg, -2, &prowlError); // Low priority for recovery
+        if (!sentProwl) addToAlertHistory("[" + deviceName + "] Prowl send FAILED: " + prowlError, 2, false, false);
+      }
+
+      if (emailEnabled && emailSender.length() > 0) {
+        String subject = deviceName + " Memory Recovered";
+        sentEmail = sendEmailNotification(subject, recoveryMsg, 0, &emailError); // Normal priority
+        if (!sentEmail) addToAlertHistory("[" + deviceName + "] Email send FAILED: " + emailError, 2, false, false);
+      }
+
+      addToAlertHistory(recoveryMsg, 0, sentProwl, sentEmail);
+      lastHeapAlertTime = millis();
+    }
+    // If still low but in cooldown, update the flag so recovery is detected later
+    else if (heapIsLow && lastHeapWasLow) {
+      // Still low — keep the flag set, no action needed
+    }
+
     lastHeapLog = millis();
   }
 
@@ -410,6 +467,8 @@ void handleRoot() {
 void handleSettings() {
   bool updated = false;
   bool hostnameChanged = false;
+  bool emailSettingsChanged = false;
+  bool prowlSettingsChanged = false;
   String oldDeviceName = deviceName;
   
   if (server.hasArg("deviceName")) {
@@ -444,6 +503,7 @@ void handleSettings() {
   
   if (server.hasArg("prowlApiKey")) {
     prowlApiKey = server.arg("prowlApiKey");
+    prowlSettingsChanged = true;
     updated = true;
   }
   
@@ -466,6 +526,7 @@ void handleSettings() {
   // Email settings
   if (server.hasArg("emailEnabled")) {
     emailEnabled = (server.arg("emailEnabled") == "true" || server.arg("emailEnabled") == "1");
+    emailSettingsChanged = true;
     updated = true;
   } else if (server.hasArg("emailSender")) {
     // If any email field is present but emailEnabled isn't, assume it's a form submission
@@ -474,32 +535,38 @@ void handleSettings() {
   
   if (server.hasArg("emailSender")) {
     emailSender = server.arg("emailSender");
+    emailSettingsChanged = true;
     updated = true;
   }
-  
+
   if (server.hasArg("emailRecipient")) {
     emailRecipient = server.arg("emailRecipient");
+    emailSettingsChanged = true;
     updated = true;
   }
-  
+
   if (server.hasArg("smtpServer")) {
     smtpServer = server.arg("smtpServer");
+    emailSettingsChanged = true;
     updated = true;
   }
-  
+
   if (server.hasArg("smtpPort")) {
     smtpPort = server.arg("smtpPort").toInt();
     if (smtpPort == 0) smtpPort = 587;
+    emailSettingsChanged = true;
     updated = true;
   }
-  
+
   if (server.hasArg("smtpUsername")) {
     smtpUsername = server.arg("smtpUsername");
+    emailSettingsChanged = true;
     updated = true;
   }
-  
+
   if (server.hasArg("smtpPassword")) {
     smtpPassword = server.arg("smtpPassword");
+    emailSettingsChanged = true;
     updated = true;
   }
   
@@ -553,8 +620,60 @@ void handleSettings() {
       configureTime();
       Serial.printf("Timezone updated to: %s\n", timezone.c_str());
     }
-    
-    server.send(200, "text/plain", "Settings saved successfully");
+
+    // Send test notifications if provider settings were changed
+    String responseMsg = "Settings saved successfully";
+    String testResults = "";
+
+    if (prowlSettingsChanged && prowlApiKey.length() > 0) {
+      String testMsg = "[" + deviceName + "] This is a test notification to confirm your Prowl settings are correct. "
+                       "If you received this, Prowl notifications are working properly!";
+      Serial.println("Prowl settings changed — sending test notification...");
+      String prowlError;
+      if (sendProwlNotification(testMsg, 0, &prowlError)) {
+        testResults += " Test Prowl sent.";
+      } else {
+        testResults += " Prowl FAILED: " + prowlError + ".";
+        addToAlertHistory("[" + deviceName + "] Prowl test FAILED: " + prowlError, 2, false, false);
+        // Cross-notify via email if configured
+        if (emailEnabled && emailSender.length() > 0) {
+          String failSubject = deviceName + " Prowl Test Failed";
+          String failBody = "[" + deviceName + "] The test Prowl notification failed with error: " + prowlError;
+          sendEmailNotification(failSubject, failBody, 2);
+        }
+      }
+    }
+
+    if (emailSettingsChanged && emailEnabled) {
+      String testSubject = deviceName + " - Test Email";
+      String testBody = "[" + deviceName + "] This is a test email to confirm your email notification settings are correct.\n\n"
+                        "If you received this, your email configuration is working properly!\n\n"
+                        "SMTP Server: " + smtpServer + ":" + String(smtpPort) + "\n"
+                        "From: " + emailSender + "\n"
+                        "To: " + emailRecipient + "\n"
+                        "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\n"
+                        "Uptime: " + String(millis() / 1000) + " seconds";
+
+      Serial.println("Email settings changed — sending test email...");
+      String emailError;
+      if (sendEmailNotification(testSubject, testBody, 0, &emailError)) {
+        testResults += " Test email sent to " + emailRecipient + ".";
+      } else {
+        testResults += " Email FAILED: " + emailError + ".";
+        addToAlertHistory("[" + deviceName + "] Email test FAILED: " + emailError, 2, false, false);
+        // Cross-notify via Prowl if configured
+        if (prowlApiKey.length() > 0) {
+          String failMsg = "[" + deviceName + "] The test email notification failed with error: " + emailError + " (SMTP: " + smtpServer + ":" + String(smtpPort) + ")";
+          sendProwlNotification(failMsg, 2);
+        }
+      }
+    }
+
+    if (testResults.length() > 0) {
+      responseMsg = "Settings saved." + testResults;
+    }
+
+    server.send(200, "text/plain", responseMsg);
   } else {
     server.send(400, "text/plain", "No settings provided");
   }
@@ -581,6 +700,7 @@ void handleGetStatus() {
   json += "\"smtpPasswordSet\":" + String(smtpPassword.length() > 0 ? "true" : "false") + ",";
   json += "\"sensorConnected\":" + String(sensorConnected ? "true" : "false") + ",";
   json += "\"wifiRSSI\":" + String(WiFi.RSSI()) + ",";
+  json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"historyCount\":" + String(historyCount);
   json += "}";
@@ -796,13 +916,22 @@ void checkAlerts() {
   if (sendAlert) {
     bool sentProwl = false;
     bool sentEmail = false;
-    
+    String prowlError, emailError;
+
     // Send Prowl notification if configured (with separate priority)
     if (prowlApiKey.length() > 0) {
-      sendProwlNotification(alertMessage, prowlPriority);
-      sentProwl = true;
+      sentProwl = sendProwlNotification(alertMessage, prowlPriority, &prowlError);
+      if (!sentProwl) {
+        addToAlertHistory("[" + deviceName + "] Prowl send FAILED: " + prowlError, 2, false, false);
+        // Cross-notify via email if Prowl failed and email is configured
+        if (emailEnabled && emailSender.length() > 0) {
+          String failSubject = deviceName + " Alert Delivery Failure";
+          String failBody = "[" + deviceName + "] Failed to send Prowl alert: " + prowlError + "\n\nOriginal alert: " + alertMessage;
+          sendEmailNotification(failSubject, failBody, 2);
+        }
+      }
     }
-    
+
     // Send Email notification if configured
     if (emailEnabled && emailSender.length() > 0) {
       String subject = deviceName + " Temperature Alert";
@@ -811,96 +940,121 @@ void checkAlerts() {
       } else if (emailPriority == 0) {
         subject = deviceName + " Status Normal";
       }
-      sendEmailNotification(subject, alertMessage, emailPriority);
-      sentEmail = true;
+      sentEmail = sendEmailNotification(subject, alertMessage, emailPriority, &emailError);
+      if (!sentEmail) {
+        addToAlertHistory("[" + deviceName + "] Email send FAILED: " + emailError, 2, false, false);
+        // Cross-notify via Prowl if email failed and Prowl is configured
+        if (prowlApiKey.length() > 0) {
+          String failMsg = "[" + deviceName + "] Failed to send email alert: " + emailError + ". Original alert: " + alertMessage;
+          sendProwlNotification(failMsg, 2);
+        }
+      }
     }
-    
+
     // Record alert in history (use email priority for display consistency)
     addToAlertHistory(alertMessage, emailPriority, sentProwl, sentEmail);
-    
+
     lastAlertTime = millis();
   }
 }
 
-void sendProwlNotification(String message, int priority) {
+bool sendProwlNotification(String message, int priority, String *errorMsg) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot send notification: WiFi not connected");
-    return;
+    if (errorMsg) *errorMsg = "WiFi not connected";
+    return false;
   }
-  
+
   Serial.println("Sending Prowl notification...");
-  
+
   http.begin("https://api.prowlapp.com/publicapi/add");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  
+
   String postData = "apikey=" + prowlApiKey;
   postData += "&application=" + urlEncode(deviceName);
   postData += "&event=Temperature Alert";
   postData += "&description=" + urlEncode(message);
   postData += "&priority=" + String(priority);
-  
+
   int httpCode = http.POST(postData);
-  
+
   if (httpCode > 0) {
     String response = http.getString();
     Serial.printf("Prowl response code: %d\n", httpCode);
     Serial.println(response);
-    
+
     if (httpCode == 200) {
       Serial.println("Notification sent successfully");
+      http.end();
+      return true;
     } else {
       Serial.println("Notification failed");
+      if (errorMsg) *errorMsg = "Prowl API returned HTTP " + String(httpCode) + ": " + response;
+      http.end();
+      return false;
     }
   } else {
-    Serial.printf("HTTP POST failed: %s\n", http.errorToString(httpCode).c_str());
+    String err = "HTTP POST failed: " + http.errorToString(httpCode);
+    Serial.println(err);
+    if (errorMsg) *errorMsg = err;
+    http.end();
+    return false;
   }
-  
-  http.end();
 }
 
-void sendEmailNotification(String subject, String message, int priority) {
+bool sendEmailNotification(String subject, String message, int priority, String *errorMsg) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot send email: WiFi not connected");
-    return;
+    if (errorMsg) *errorMsg = "WiFi not connected";
+    return false;
   }
-  
+
   if (!emailEnabled || emailSender.length() == 0 || emailRecipient.length() == 0 || smtpServer.length() == 0) {
     Serial.println("Email not configured properly");
-    return;
+    if (errorMsg) *errorMsg = "Email not fully configured";
+    return false;
   }
-  
+
   Serial.println("Sending email notification...");
-  
-  // Set the callback function for SMTP session
+
+  // Configure the global SMTP session
   smtp.debug(1);
   smtp.callback(smtpCallback);
-  
+  smtp.setTCPTimeout(30); // 30 second timeout for slow servers
+
   // Declare the Session_Config for user defined session credentials
   Session_Config config;
-  
+
   // Set the session config
   config.server.host_name = smtpServer.c_str();
   config.server.port = smtpPort;
-  config.login.email = smtpUsername.length() > 0 ? smtpUsername.c_str() : emailSender.c_str();
-  config.login.password = smtpPassword.c_str();
-  
+
+  // Only set login credentials if authentication is configured.
+  // Sending a non-empty login.email with an empty password causes
+  // the library to attempt AUTH on servers that don't support it.
+  if (smtpUsername.length() > 0 || smtpPassword.length() > 0) {
+    config.login.email = smtpUsername.length() > 0 ? smtpUsername.c_str() : emailSender.c_str();
+    config.login.password = smtpPassword.c_str();
+  }
+  // else: leave both empty — no AUTH attempt, plain SMTP
+
   // For library version 3.x only - comment out for older versions
   config.login.user_domain = "";
-  
+
   // Set the NTP config time
   config.time.ntp_server = "pool.ntp.org,time.nist.gov";
   config.time.gmt_offset = 0;
   config.time.day_light_offset = 0;
-  
+
   // Declare the message class
   SMTP_Message email;
-  
+
   // Set the message headers
   email.sender.name = deviceName;
   email.sender.email = emailSender;
   email.subject = subject;
   email.addRecipient("User", emailRecipient);
-  
+
   // Set the message content
   String htmlMsg = "<div style='font-family: Arial, sans-serif;'>";
   htmlMsg += "<h2 style='color: " + String(priority >= 2 ? "#d32f2f" : (priority == 0 ? "#388e3c" : "#f57c00")) + ";'>" + subject + "</h2>";
@@ -910,28 +1064,43 @@ void sendEmailNotification(String subject, String message, int priority) {
   htmlMsg += "Time: " + String(millis() / 1000) + " seconds uptime<br>";
   htmlMsg += "WiFi Signal: " + String(WiFi.RSSI()) + " dBm</p>";
   htmlMsg += "</div>";
-  
+
   email.html.content = htmlMsg.c_str();
   email.html.charSet = "utf-8";
   email.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
-  
+
   email.priority = priority >= 2 ? esp_mail_smtp_priority_high : (priority == 0 ? esp_mail_smtp_priority_normal : esp_mail_smtp_priority_normal);
-  
-  // Connect to the server
-  if (!smtp.connect(&config)) {
-    Serial.printf("Connection error: %s\n", smtp.errorReason().c_str());
-    return;
+
+  // Connect to the server.
+  // Pass login=false to skip AUTH when no credentials are configured.
+  bool doLogin = (smtpUsername.length() > 0 || smtpPassword.length() > 0);
+  if (!smtp.connect(&config, doLogin)) {
+    String reason = smtp.errorReason();
+    if (reason.length() == 0) {
+      reason = "Unable to connect to " + smtpServer + ":" + String(smtpPort) + " (no detailed error from library)";
+    }
+    String err = "SMTP error: " + reason;
+    Serial.println(err);
+    if (errorMsg) *errorMsg = err;
+    return false;
   }
-  
+
   // Start sending Email
   if (!MailClient.sendMail(&smtp, &email)) {
-    Serial.printf("Error sending email: %s\n", smtp.errorReason().c_str());
-  } else {
-    Serial.println("Email sent successfully");
+    String reason = smtp.errorReason();
+    if (reason.length() == 0) {
+      reason = "Send failed to " + smtpServer + ":" + String(smtpPort) + " (no detailed error from library)";
+    }
+    String err = "SMTP error: " + reason;
+    Serial.println(err);
+    if (errorMsg) *errorMsg = err;
+    smtp.closeSession();
+    return false;
   }
-  
-  // Close the session
+
+  Serial.println("Email sent successfully");
   smtp.closeSession();
+  return true;
 }
 
 // Callback function to get the Email sending status
@@ -1363,6 +1532,10 @@ String getHTML() {
           <div class="status-label">WiFi</div>
           <div class="status-value" id="wifiStatus">--</div>
         </div>
+        <div class="status-item">
+          <div class="status-label">Free Heap</div>
+          <div class="status-value" id="heapStatus">--</div>
+        </div>
       </div>
       
       <h2 class="section-title">📊 Temperature History</h2>
@@ -1732,7 +1905,15 @@ String getHTML() {
           else if (wifiRSSI > -70) wifiIcon = '📶📶';
           else wifiIcon = '📶';
           document.getElementById('wifiStatus').textContent = wifiIcon + ' ' + wifiRSSI + 'dBm';
-          
+
+          // Update heap status
+          const freeHeap = data.freeHeap || 0;
+          const heapKB = (freeHeap / 1024.0).toFixed(1);
+          let heapColor = '#4CAF50'; // Green for OK
+          if (freeHeap < 30000) heapColor = '#F44336'; // Red for critically low
+          else if (freeHeap < 60000) heapColor = '#FF9800'; // Orange for warning
+          document.getElementById('heapStatus').innerHTML = '<span style="color:' + heapColor + '">' + heapKB + ' KB</span>';
+
           // Only populate form fields on first load
           if (!formLoaded) {
             document.getElementById('deviceName').value = data.deviceName || 'FreezerProbe';
