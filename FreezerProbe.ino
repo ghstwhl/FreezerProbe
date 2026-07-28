@@ -31,9 +31,12 @@
 // ===== Temperature Monitoring =====
 #define TEMP_READ_INTERVAL 10000    // Read temperature every 10 seconds
 #define ALERT_COOLDOWN 300000       // Wait 5 minutes between alerts (avoid spam)
+#define SENSOR_RETRY_INTERVAL 60000 // Only retry sensor detection every 60 seconds
 #define HISTORY_SIZE 288            // Store 288 readings (48 hours at 10-second intervals)
 #define ALERT_HISTORY_SIZE 50       // Store last 50 alerts
 #define NTP_UPDATE_INTERVAL 300000  // Update NTP time every 5 minutes
+#define HEAP_LOG_INTERVAL 3600000   // Log free heap every hour
+#define HEAP_WARN_THRESHOLD 30000   // Warn if free heap drops below 30KB
 
 // ===== Global Objects =====
 OneWire oneWire(ONE_WIRE_BUS);
@@ -90,9 +93,17 @@ bool sensorConnected = false;
 unsigned long lastTempRead = 0;
 unsigned long lastAlertTime = 0;
 unsigned long lastNtpUpdate = 0;
+unsigned long lastSensorRetry = 0;
+unsigned long lastHeapLog = 0;
 bool lastAlertWasHigh = false;
 bool lastAlertWasLow = false;
 bool lastAlertWasSensorError = false;
+
+// Consecutive reading counters for alert threshold
+int consecutiveLowReadings = 0;
+int consecutiveHighReadings = 0;
+int consecutiveSensorErrorReadings = 0;
+int consecutiveNormalReadings = 0;
 
 // ===== Function Prototypes =====
 void connectWiFi();
@@ -174,20 +185,38 @@ void setup() {
 void loop() {
   ArduinoOTA.handle(); // Handle OTA updates
   server.handleClient();
-  
-  // Update NTP time periodically
+
+  // Verify NTP time is still valid (ESP32 sntp auto-syncs, no need to reconfigure)
+  // Only reconfigure if time appears to have gone backwards or is still in 1970
+  static time_t lastValidTime = 0;
   if (millis() - lastNtpUpdate >= NTP_UPDATE_INTERVAL) {
-    configureTime();
+    time_t now = time(nullptr);
+    // Only reconfigure if time went backwards or is before 2024 (unlikely valid)
+    if (now < lastValidTime || now < 1704067200) { // 1704067200 = Jan 1, 2024
+      Serial.println("NTP time appears invalid, reconfiguring...");
+      configureTime();
+    }
+    lastValidTime = now;
     lastNtpUpdate = millis();
   }
-  
+
+  // Log free heap periodically to monitor for memory leaks
+  if (millis() - lastHeapLog >= HEAP_LOG_INTERVAL) {
+    uint32_t freeHeap = ESP.getFreeHeap();
+    Serial.printf("[Heap Monitor] Free heap: %u bytes (%.1f KB)\n", freeHeap, freeHeap / 1024.0);
+    if (freeHeap < HEAP_WARN_THRESHOLD) {
+      Serial.printf("⚠️ WARNING: Free heap below %d bytes! Restart may be needed.\n", HEAP_WARN_THRESHOLD);
+    }
+    lastHeapLog = millis();
+  }
+
   // Read temperature at intervals
   if (millis() - lastTempRead >= TEMP_READ_INTERVAL) {
     readTemperature();
     checkAlerts();
     lastTempRead = millis();
   }
-  
+
   delay(10); // Small delay to prevent watchdog issues
 }
 
@@ -232,6 +261,7 @@ void connectWiFi() {
   Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
   Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+  Serial.printf("Free Heap after WiFi: %d bytes\n", ESP.getFreeHeap());
 }
 
 void setupOTA() {
@@ -254,28 +284,59 @@ void setupOTA() {
     } else { // U_SPIFFS
       type = "filesystem";
     }
-    Serial.println("Start updating " + type);
+    
+    // Print memory info before OTA
+    Serial.printf("\n=== Starting OTA Update ===\n");
+    Serial.printf("Update Type: %s\n", type.c_str());
+    Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Heap Size: %d bytes\n", ESP.getHeapSize());
+    Serial.printf("Free Sketch Space: %d bytes\n", ESP.getFreeSketchSpace());
+    
+    // Stop web server and free resources for OTA
+    server.stop();
+    Serial.println("Web server stopped for OTA");
   });
   
   ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
+    Serial.println("\nOTA Update Complete!");
+    digitalWrite(LED_PIN, HIGH);
   });
   
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    // Blink LED during update
-    if (progress % 1000 == 0) {
+    static unsigned int lastPercent = 0;
+    unsigned int percent = (progress / (total / 100));
+    
+    // Only print every 10% to reduce serial overhead
+    if (percent != lastPercent && percent % 10 == 0) {
+      Serial.printf("Progress: %u%%\n", percent);
+      lastPercent = percent;
+    }
+    
+    // Blink LED during update (every 64KB to reduce overhead)
+    if (progress % 65536 == 0) {
       digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     }
   });
   
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    Serial.printf("\n=== OTA Error[%u] ===\n", error);
+    Serial.printf("Free Heap at error: %d bytes\n", ESP.getFreeHeap());
+    
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Error: Authentication Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Error: Begin Failed - Check partition scheme and available space");
+      Serial.printf("Free Sketch Space: %d bytes\n", ESP.getFreeSketchSpace());
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Error: Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Error: Receive Failed - Network or memory issue");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("Error: End Failed - Update verification failed");
+    }
+    
+    Serial.println("OTA update failed. Device will continue with current firmware.");
+    digitalWrite(LED_PIN, LOW);
   });
   
   ArduinoOTA.begin();
@@ -463,6 +524,10 @@ void handleSettings() {
     lastAlertWasHigh = false;
     lastAlertWasLow = false;
     lastAlertWasSensorError = false;
+    consecutiveLowReadings = 0;
+    consecutiveHighReadings = 0;
+    consecutiveSensorErrorReadings = 0;
+    consecutiveNormalReadings = 0;
     
     Serial.println("Settings updated:");
     Serial.printf("  Device Name: %s\n", deviceName.c_str());
@@ -496,7 +561,9 @@ void handleSettings() {
 }
 
 void handleGetStatus() {
-  String json = "{";
+  String json;
+  json.reserve(800); // Pre-allocate to prevent heap fragmentation
+  json = "{";
   json += "\"deviceName\":\"" + deviceName + "\",";
   json += "\"timezone\":\"" + timezone + "\",";
   json += "\"temperature\":" + String(currentTemperature, 2) + ",";
@@ -522,7 +589,9 @@ void handleGetStatus() {
 }
 
 void handleGetHistory() {
-  String json = "{\"readings\":[";
+  String json;
+  json.reserve(16000); // Pre-allocate for up to 288 readings (~50 bytes each)
+  json = "{\"readings\":[";
   
   // Send temperature history
   int count = min(historyCount, HISTORY_SIZE);
@@ -542,7 +611,9 @@ void handleGetHistory() {
 }
 
 void handleGetAlertHistory() {
-  String json = "{\"alerts\":[";
+  String json;
+  json.reserve(8000); // Pre-allocate for up to 50 alerts (~100 bytes each)
+  json = "{\"alerts\":[";
   
   // Send alert history (most recent first)
   int count = min(alertHistoryCount, ALERT_HISTORY_SIZE);
@@ -567,13 +638,21 @@ void handleGetAlertHistory() {
 // ===== Temperature Functions =====
 void readTemperature() {
   if (!sensorConnected) {
-    // Try to detect sensor again
-    sensors.begin();
-    int deviceCount = sensors.getDeviceCount();
-    sensorConnected = (deviceCount > 0);
-    
+    // Only attempt reconnection periodically to avoid heap fragmentation
+    // from repeated sensors.begin() calls
+    if (millis() - lastSensorRetry >= SENSOR_RETRY_INTERVAL) {
+      lastSensorRetry = millis();
+      sensors.begin();
+      int deviceCount = sensors.getDeviceCount();
+      sensorConnected = (deviceCount > 0);
+
+      if (sensorConnected) {
+        sensors.setResolution(12);
+        Serial.println("Sensor reconnected!");
+      }
+    }
+
     if (!sensorConnected) {
-      Serial.println("No sensor detected");
       currentTemperature = -999.0; // Error value
       return;
     }
@@ -624,89 +703,120 @@ void checkAlerts() {
     return;
   }
   
-  // Check cooldown period
-  if (millis() - lastAlertTime < ALERT_COOLDOWN) {
-    return;
-  }
-  
   bool sendAlert = false;
   String alertMessage = "";
-  int priority = 0;
+  int prowlPriority = 0;
+  int emailPriority = 0;
   
-  // Check for sensor disconnection or error
-  if (!sensorConnected || currentTemperature == -999.0) {
-    if (!lastAlertWasSensorError) {
-      // Sensor just disconnected or error occurred
-      sendAlert = true;
-      lastAlertWasSensorError = true;
-      lastAlertWasHigh = false;
-      lastAlertWasLow = false;
-      alertMessage = "[" + deviceName + "] ALERT: Temperature sensor disconnected or error reading sensor!";
-      priority = 2; // High priority
-      Serial.println(alertMessage);
-    }
+  // Determine current condition
+  bool isSensorError = (!sensorConnected || currentTemperature == -999.0);
+  bool isTempLow = (!isSensorError && currentTemperature < lowerThreshold);
+  bool isTempHigh = (!isSensorError && currentTemperature > upperThreshold);
+  bool isTempNormal = (!isSensorError && currentTemperature >= lowerThreshold && currentTemperature <= upperThreshold);
+  
+  // Update consecutive reading counters based on current condition
+  if (isSensorError) {
+    consecutiveSensorErrorReadings++;
+    consecutiveLowReadings = 0;
+    consecutiveHighReadings = 0;
+    consecutiveNormalReadings = 0;
+  } else if (isTempLow) {
+    consecutiveLowReadings++;
+    consecutiveHighReadings = 0;
+    consecutiveSensorErrorReadings = 0;
+    consecutiveNormalReadings = 0;
+  } else if (isTempHigh) {
+    consecutiveHighReadings++;
+    consecutiveLowReadings = 0;
+    consecutiveSensorErrorReadings = 0;
+    consecutiveNormalReadings = 0;
+  } else if (isTempNormal) {
+    consecutiveNormalReadings++;
+    consecutiveLowReadings = 0;
+    consecutiveHighReadings = 0;
+    consecutiveSensorErrorReadings = 0;
   }
-  // Check for sensor recovery
-  else if (lastAlertWasSensorError) {
+  
+  // Check cooldown period (skip if already cooling down)
+  bool inCooldown = (millis() - lastAlertTime < ALERT_COOLDOWN);
+  
+  // Check for sensor error alert (3 consecutive error readings)
+  if (consecutiveSensorErrorReadings >= 3 && !lastAlertWasSensorError && !inCooldown) {
+    sendAlert = true;
+    lastAlertWasSensorError = true;
+    lastAlertWasHigh = false;
+    lastAlertWasLow = false;
+    alertMessage = "[" + deviceName + "] ALERT: Temperature sensor disconnected or error reading sensor!";
+    prowlPriority = 2; // High priority
+    emailPriority = 2;
+    Serial.println(alertMessage);
+  }
+  // Check for sensor recovery (3 consecutive normal readings after sensor error)
+  else if (consecutiveNormalReadings >= 3 && lastAlertWasSensorError && !inCooldown) {
     sendAlert = true;
     lastAlertWasSensorError = false;
     alertMessage = "[" + deviceName + "] Sensor reconnected. Current temperature: " + String(currentTemperature, 2) + "°C";
-    priority = 0; // Normal priority
+    prowlPriority = -2; // Low priority for recovery
+    emailPriority = 0;  // Normal priority for email
     Serial.println(alertMessage);
   }
-  // Normal temperature threshold checks (only if sensor is working)
-  else if (currentTemperature < lowerThreshold && !lastAlertWasLow) {
+  // Check for low temperature alert (3 consecutive low readings)
+  else if (consecutiveLowReadings >= 3 && !lastAlertWasLow && !inCooldown) {
     sendAlert = true;
     lastAlertWasLow = true;
     lastAlertWasHigh = false;
+    lastAlertWasSensorError = false;
     alertMessage = "[" + deviceName + "] ALERT: Temperature too LOW! Current: " + String(currentTemperature, 2) + "°C (Threshold: " + String(lowerThreshold, 2) + "°C)";
-    priority = 2; // High priority
+    prowlPriority = 2; // High priority
+    emailPriority = 2;
     Serial.println(alertMessage);
-  } 
-  else if (currentTemperature > upperThreshold && !lastAlertWasHigh) {
+  }
+  // Check for high temperature alert (3 consecutive high readings)
+  else if (consecutiveHighReadings >= 3 && !lastAlertWasHigh && !inCooldown) {
     sendAlert = true;
     lastAlertWasHigh = true;
     lastAlertWasLow = false;
+    lastAlertWasSensorError = false;
     alertMessage = "[" + deviceName + "] ALERT: Temperature too HIGH! Current: " + String(currentTemperature, 2) + "°C (Threshold: " + String(upperThreshold, 2) + "°C)";
-    priority = 2; // High priority
+    prowlPriority = 2; // High priority
+    emailPriority = 2;
     Serial.println(alertMessage);
   }
-  else if (currentTemperature >= lowerThreshold && currentTemperature <= upperThreshold) {
-    // Temperature returned to normal range
-    if (lastAlertWasLow || lastAlertWasHigh) {
-      sendAlert = true;
-      alertMessage = "[" + deviceName + "] Temperature returned to normal: " + String(currentTemperature, 2) + "°C";
-      priority = 0; // Normal priority
-      lastAlertWasLow = false;
-      lastAlertWasHigh = false;
-      Serial.println(alertMessage);
-    }
+  // Check for temperature recovery (3 consecutive normal readings after alert)
+  else if (consecutiveNormalReadings >= 3 && (lastAlertWasLow || lastAlertWasHigh) && !inCooldown) {
+    sendAlert = true;
+    alertMessage = "[" + deviceName + "] Temperature returned to normal: " + String(currentTemperature, 2) + "°C";
+    prowlPriority = -2; // Low priority for recovery
+    emailPriority = 0;  // Normal priority for email
+    lastAlertWasLow = false;
+    lastAlertWasHigh = false;
+    Serial.println(alertMessage);
   }
   
   if (sendAlert) {
     bool sentProwl = false;
     bool sentEmail = false;
     
-    // Send Prowl notification if configured
+    // Send Prowl notification if configured (with separate priority)
     if (prowlApiKey.length() > 0) {
-      sendProwlNotification(alertMessage, priority);
+      sendProwlNotification(alertMessage, prowlPriority);
       sentProwl = true;
     }
     
     // Send Email notification if configured
     if (emailEnabled && emailSender.length() > 0) {
       String subject = deviceName + " Temperature Alert";
-      if (lastAlertWasSensorError && priority == 2) {
+      if (lastAlertWasSensorError && emailPriority == 2) {
         subject = deviceName + " Sensor Error";
-      } else if (priority == 0) {
+      } else if (emailPriority == 0) {
         subject = deviceName + " Status Normal";
       }
-      sendEmailNotification(subject, alertMessage, priority);
+      sendEmailNotification(subject, alertMessage, emailPriority);
       sentEmail = true;
     }
     
-    // Record alert in history
-    addToAlertHistory(alertMessage, priority, sentProwl, sentEmail);
+    // Record alert in history (use email priority for display consistency)
+    addToAlertHistory(alertMessage, emailPriority, sentProwl, sentEmail);
     
     lastAlertTime = millis();
   }
@@ -884,7 +994,8 @@ void saveSettings() {
 
 // ===== Utility Functions =====
 String urlEncode(String str) {
-  String encoded = "";
+  String encoded;
+  encoded.reserve(str.length() * 3); // Worst case: every char becomes %XX
   char c;
   char code0;
   char code1;
@@ -994,7 +1105,8 @@ void updateHostname(String newHostname) {
 
 // ===== HTML Generation =====
 String getHTML() {
-  String html = R"rawliteral(
+  // Store HTML in PROGMEM (flash) to reduce RAM usage during OTA
+  static const char html_template[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1278,7 +1390,8 @@ String getHTML() {
       </div>
       
       <div class="info-box">
-        ℹ️ Alerts will be sent via Prowl and/or Email when temperature goes outside the threshold range. 
+        ℹ️ Alerts require <strong>3 consecutive out-of-bounds readings</strong> (30 seconds) to trigger, preventing false alarms from brief door openings. 
+        Prowl notifications use priority 2 (high) for alerts and -2 (low) for recovery. 
         A 5-minute cooldown prevents notification spam. Configure at least one notification method below.
       </div>
       
@@ -1857,6 +1970,7 @@ String getHTML() {
 </html>
 )rawliteral";
   
-  return html;
+  // Convert PROGMEM string to String object
+  return String(FPSTR(html_template));
 }
 

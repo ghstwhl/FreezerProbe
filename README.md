@@ -15,7 +15,7 @@ ESP32-based temperature monitoring system for freezers and refrigerators with pu
 - 📶 WiFi Manager for easy setup (no hardcoded credentials)
 - 🌐 Web interface accessible via browser
 - 💾 Persistent settings stored in flash memory
-- 🔔 Smart alerting with 5-minute cooldown to prevent spam
+- 🔔 Smart alerting with 3-reading threshold and 5-minute cooldown to prevent false alarms
 - 🏷️ Configurable device name for multi-device setups
 - 🔒 Secure field handling for API keys and passwords (masked display)
 
@@ -158,12 +158,35 @@ DS18B20 Sensor          ESP32
 
 ### 2. Development Environment
 
-This project uses a dev container with Arduino CLI. To rebuild the container with all dependencies:
+You can use either **Arduino CLI** (recommended for VS Code) or the **Arduino IDE**.
+
+#### Option A: Arduino CLI (VS Code Dev Container)
+
+This project includes a dev container with Arduino CLI and all dependencies pre-installed.
 
 ```bash
-# Rebuild dev container
+# Rebuild dev container to install all dependencies
 Ctrl+Shift+P → "Dev Containers: Rebuild Container"
 ```
+
+#### Option B: Arduino IDE
+
+**Install ESP32 Board Support**:
+1. Open **File → Preferences**
+2. Add to "Additional Board Manager URLs":
+   ```
+   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+   ```
+3. Open **Tools → Board → Boards Manager**
+4. Search "esp32" and install **"esp32 by Espressif Systems"**
+
+**Install Required Libraries**:
+1. Open **Tools → Manage Libraries** (or Ctrl+Shift+I)
+2. Install these libraries:
+   - **OneWire**
+   - **DallasTemperature**
+   - **WiFiManager** by tzapu
+   - **ESP Mail Client**
 
 ### 3. Change Partition Scheme
 
@@ -197,17 +220,42 @@ If you're not using GPIO4 for the DS18B20 data line, update line 27 in `FreezerP
 
 ### 5. Compile and Upload
 
-Using Arduino CLI:
+#### Option A: Using Arduino CLI
 
 ```bash
 # Compile for ESP32 with Minimal SPIFFS partition scheme
 arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs FreezerProbe.ino
 
-# Upload (replace /dev/ttyUSB0 with your port)
+# Upload via USB (replace /dev/ttyUSB0 with your port: COM3, /dev/ttyUSB0, etc.)
 arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs FreezerProbe.ino
 ```
 
-Or use the Arduino IDE / VS Code Arduino extension (remember to select the partition scheme in Tools menu).
+**Find your port**:
+```bash
+# Linux/Mac
+ls /dev/tty.* /dev/ttyUSB*
+
+# Windows (in PowerShell)
+[System.IO.Ports.SerialPort]::getportnames()
+```
+
+#### Option B: Using Arduino IDE
+
+**Configure Board Settings**:
+1. **Tools → Board** → Select "ESP32 Dev Module" (or your specific ESP32 board)
+2. **Tools → Partition Scheme** → Select **"Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"** ⚠️ **REQUIRED**
+3. **Tools → Upload Speed** → 921600 (or 115200 if upload fails)
+4. **Tools → Port** → Select your ESP32's COM/serial port
+
+**Compile and Upload**:
+1. Click the **Verify** button (✓) or **Sketch → Verify/Compile** to compile
+2. Click the **Upload** button (→) or **Sketch → Upload** to upload
+3. Wait for "Hard resetting via RTS pin..." message
+
+**Monitor Serial Output** (optional but recommended):
+- **Tools → Serial Monitor**
+- Set baud rate to **115200**
+- Watch for IP address and connection status
 
 ### 6. Initial WiFi Setup
 
@@ -344,15 +392,21 @@ The web interface provides:
 ### Notifications
 
 Notifications are sent via **Prowl** and/or **Email** when:
-- Temperature drops below lower threshold
-- Temperature rises above upper threshold  
-- Temperature returns to normal range (recovery notification)
-- **Sensor disconnects or error reading temperature** (high priority alert)
-- **Sensor reconnects** after being disconnected (recovery notification)
+- Temperature drops below lower threshold (after 3 consecutive low readings)
+- Temperature rises above upper threshold (after 3 consecutive high readings)
+- Temperature returns to normal range (after 3 consecutive normal readings)
+- **Sensor disconnects or error reading temperature** (after 3 consecutive error readings)
+- **Sensor reconnects** after being disconnected (after 3 consecutive normal readings)
 
 All notifications include the **device name** to help identify which freezer/fridge sent the alert.
 
-**Note**: 5-minute cooldown between alerts prevents spam
+**Alert Thresholds**: Alerts require **3 consecutive out-of-bounds readings** (30 seconds at 10-second intervals) before triggering. This prevents false alarms from brief temperature spikes when opening doors or temporary sensor glitches.
+
+**Prowl Priority Levels**:
+- **High Priority (2)**: Temperature alerts and sensor errors
+- **Low Priority (-2)**: Recovery notifications when conditions return to normal
+
+**Cooldown**: 5-minute cooldown between alerts prevents notification spam
 
 #### Sensor Error Alerts
 
@@ -361,12 +415,14 @@ The system monitors sensor connectivity and will send high-priority alerts if:
 - Temperature readings fail or return error values
 - Communication errors occur on the 1-Wire bus
 
+**Alert Threshold**: 3 consecutive sensor error readings required before alerting.
+
 When the sensor recovers:
-- A normal-priority recovery notification is sent
+- A low-priority recovery notification is sent (after 3 consecutive successful readings)
 - Current temperature is included in the recovery message
 - Temperature monitoring resumes automatically
 
-This ensures you're notified immediately if your monitoring system loses sensor connectivity, preventing silent failures.
+This ensures you're notified of persistent sensor issues while avoiding false alarms from momentary connection problems.
 
 #### Alert History
 
@@ -396,15 +452,42 @@ Common SMTP server settings:
 
 ### OTA Updates
 
-Update firmware over WiFi without USB cable:
+Update firmware over WiFi without USB cable after the initial upload.
+
+#### Option A: Using Arduino CLI
 
 ```bash
-# Using Arduino CLI (replace [devicename] with your configured device name)
+# Compile first
 arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs FreezerProbe.ino
+
+# Upload via network (replace [devicename] with your configured device name)
 arduino-cli upload -p [devicename].local --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs FreezerProbe.ino
+
+# Alternative: Use IP address if mDNS not working
+arduino-cli upload -p 192.168.1.100 --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs FreezerProbe.ino
 ```
 
-Or use the Arduino IDE with Network Port option. The device will appear as your configured device name in the network ports list. **Remember**: Make sure the same partition scheme is selected in Tools menu.
+If you've set an OTA password, you'll be prompted to enter it.
+
+#### Option B: Using Arduino IDE
+
+1. **Select Network Port**:
+   - **Tools → Port** → Look for your device name (e.g., "freezerprobe at 192.168.1.100")
+   - It will appear as a network port (not a serial port like COM3 or /dev/ttyUSB0)
+
+2. **Verify Settings**:
+   - **Tools → Partition Scheme** → **"Minimal SPIFFS (1.9MB APP with OTA)"** ⚠️ Must match existing firmware
+
+3. **Upload**:
+   - Click the **Upload** button (→) or **Sketch → Upload**
+   - If you've set an OTA password, you'll be prompted to enter it
+   - Monitor progress in the Arduino IDE output window
+
+**Important Notes**:
+- Partition scheme **must match** the scheme used for the initial USB upload
+- For best results, restart the ESP32 and upload within the first minute after boot
+- Ensure strong WiFi signal during OTA updates
+- If OTA fails, see "OTA Updates Failing" in Troubleshooting section below
 
 **OTA Password Protection**: If you've configured an OTA password in the web interface, you'll be prompted to enter it when uploading firmware. This prevents unauthorized firmware updates. Leave the OTA password field empty to disable authentication.
 
@@ -478,12 +561,60 @@ See section "3. Change Partition Scheme" above for detailed instructions.
 - Check if sensor is touching metal (electrical isolation needed)
 - Calibrate against known reference
 
+### OTA Updates Failing
+
+**"No response from device" after authentication**:
+
+This indicates insufficient memory for the OTA process. The sketch is large (~1.5MB) and requires significant heap memory during updates.
+
+**Solutions**:
+
+1. **Ensure correct partition scheme**: You MUST use "Minimal SPIFFS (1.9MB APP with OTA)" partition scheme
+   
+   **Arduino CLI**:
+   ```bash
+   arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs FreezerProbe.ino
+   arduino-cli upload --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -p [PORT] FreezerProbe.ino
+   ```
+   
+   **Arduino IDE**:
+   - **Tools → Partition Scheme** → **"Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"**
+
+2. **Check free memory**: Connect via serial monitor during OTA. The sketch now prints heap information:
+   ```
+   === Starting OTA Update ===
+   Free Heap: XXXXX bytes
+   Free Sketch Space: XXXXXX bytes
+   ```
+   You need at least 50-100KB of free heap for successful OTA.
+   
+   **Open Serial Monitor**:
+   - **Arduino IDE**: Tools → Serial Monitor (set to 115200 baud)
+   - **Arduino CLI**: `arduino-cli monitor -p [PORT] -c baudrate=115200`
+
+3. **Restart the device**: Before attempting OTA, restart the ESP32 to free up maximum memory
+
+4. **Reduce memory usage**: If still failing:
+   - Clear browser cache before accessing the web interface
+   - Avoid opening multiple browser tabs to the device
+   - Wait a few minutes after boot before attempting OTA (let the device stabilize)
+
+5. **Network stability**: Ensure strong WiFi signal during OTA update. Weak signal can cause timeouts.
+
+**Serial Monitor Debugging**:
+- **Arduino IDE**: Tools → Serial Monitor (set to 115200 baud)
+- **Arduino CLI**: `arduino-cli monitor -p [PORT] -c baudrate=115200`
+
+Connect during OTA to see detailed error messages and memory statistics.
+
 ## Technical Specifications
 
 - **Temperature Reading Interval**: 10 seconds
 - **Temperature History**: 288 readings (48 hours)
 - **Alert History**: 50 most recent alerts (in memory, cleared on restart)
-- **Alert Cooldown**: 5 minutes
+- **Alert Threshold**: 3 consecutive out-of-bounds readings (30 seconds) required before alerting
+- **Alert Cooldown**: 5 minutes between alerts
+- **Prowl Priority Levels**: 2 (high) for alerts, -2 (low) for recovery notifications
 - **NTP Sync Interval**: 5 minutes (automatic time synchronization)
 - **NTP Servers**: pool.ntp.org, time.nist.gov
 - **Timezone Support**: Configurable via POSIX TZ strings (25+ common timezones)
