@@ -379,7 +379,7 @@ The web interface provides:
   - 🔵 Blue: Below lower threshold
   - 🟢 Green: Within normal range
   - 🔴 Red: Above upper threshold
-- **Temperature history graph** (last 48 hours with local time)
+- **Temperature history graph** (last 48 hours at 10-minute intervals)
 - **Alert history table** showing last 50 notifications sent with timestamps
 - **Timezone configuration** with automatic NTP synchronization
 - **Threshold configuration**
@@ -647,7 +647,7 @@ Connect during OTA to see detailed error messages and memory statistics.
 ## Technical Specifications
 
 - **Temperature Reading Interval**: 10 seconds
-- **Temperature History**: 288 readings (48 hours)
+- **Temperature History**: 288 readings at 10-minute intervals (covers 48 hours)
 - **Alert History**: 50 most recent alerts (in memory, cleared on restart)
 - **Alert Threshold**: 3 consecutive out-of-bounds readings (30 seconds) required before alerting
 - **Alert Cooldown**: 5 minutes between temperature alerts

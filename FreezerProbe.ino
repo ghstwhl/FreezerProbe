@@ -31,8 +31,9 @@
 // ===== Temperature Monitoring =====
 #define TEMP_READ_INTERVAL 10000    // Read temperature every 10 seconds
 #define ALERT_COOLDOWN 300000       // Wait 5 minutes between alerts (avoid spam)
+#define HISTORY_STORE_INTERVAL 600000  // Store reading to history every 10 minutes (48h with 288 slots)
 #define SENSOR_RETRY_INTERVAL 60000 // Only retry sensor detection every 60 seconds
-#define HISTORY_SIZE 288            // Store 288 readings (48 hours at 10-second intervals)
+#define HISTORY_SIZE 288            // Store 288 readings (48 hours at 10-minute intervals)
 #define ALERT_HISTORY_SIZE 50       // Store last 50 alerts
 #define NTP_UPDATE_INTERVAL 300000  // Update NTP time every 5 minutes
 #define HEAP_LOG_INTERVAL 3600000   // Log free heap every hour
@@ -96,6 +97,7 @@ unsigned long lastAlertTime = 0;
 unsigned long lastNtpUpdate = 0;
 unsigned long lastSensorRetry = 0;
 unsigned long lastHeapLog = 0;
+unsigned long lastHistoryStore = 0;
 unsigned long lastHeapAlertTime = 0;
 bool lastAlertWasHigh = false;
 bool lastAlertWasLow = false;
@@ -181,7 +183,13 @@ void setup() {
   
   // Initial temperature reading
   readTemperature();
-  
+
+  // Store initial reading to history (now decoupled from readTemperature)
+  if (sensorConnected && currentTemperature != -999.0) {
+    addToHistory(currentTemperature);
+  }
+  lastHistoryStore = millis();
+
   Serial.println("=== Setup Complete ===\n");
 }
 
@@ -267,11 +275,19 @@ void loop() {
     lastHeapLog = millis();
   }
 
-  // Read temperature at intervals
+  // Read temperature at short intervals for responsive alerts
   if (millis() - lastTempRead >= TEMP_READ_INTERVAL) {
     readTemperature();
     checkAlerts();
     lastTempRead = millis();
+  }
+
+  // Store reading to history at longer intervals (every 10 minutes)
+  if (millis() - lastHistoryStore >= HISTORY_STORE_INTERVAL) {
+    if (sensorConnected && currentTemperature != -999.0) {
+      addToHistory(currentTemperature);
+    }
+    lastHistoryStore = millis();
   }
 
   delay(10); // Small delay to prevent watchdog issues
@@ -788,7 +804,6 @@ void readTemperature() {
     currentTemperature = -999.0;
   } else {
     currentTemperature = temp;
-    addToHistory(temp); // Add to history
     Serial.printf("Temperature: %.2f°C\n", currentTemperature);
   }
 }
